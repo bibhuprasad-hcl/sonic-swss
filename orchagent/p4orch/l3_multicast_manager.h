@@ -300,6 +300,10 @@ class L3MulticastManager : public ObjectManagerInterface {
   // Verifies ASIC DB for a multicast group entry.
   std::string verifyMulticastGroupStateAsicDb(
       const P4MulticastGroupEntry* multicast_group_entry);
+  std::string verifyIpMulticastGroupStateAsicDb(
+      const P4MulticastGroupEntry* multicast_group_entry);
+  std::string verifyL2MulticastGroupStateAsicDb(
+      const P4MulticastGroupEntry* multicast_group_entry);
 
   // Gets the internal cached multicast router interface entry.
   // Return nullptr if corresponding multicast router interface entry is not

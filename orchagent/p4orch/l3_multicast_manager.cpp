@@ -2894,9 +2894,24 @@ std::string L3MulticastManager::verifyMulticastGroupStateCache(
     return msg.str();
   }
 
+  auto is_ipmc_or = validateReplicas(*multicast_group_entry);
+  if (!is_ipmc_or.ok()) {
+    std::stringstream msg;
+    msg << "Unable to determine multicast group type for "
+        << QuotedVar(multicast_group_entry->multicast_group_id);
+    return msg.str();
+  }
+  bool is_ipmc = *is_ipmc_or;
+
+  sai_object_type_t group_type = SAI_OBJECT_TYPE_IPMC_GROUP;
+  sai_object_type_t group_member_type = SAI_OBJECT_TYPE_IPMC_GROUP_MEMBER;
+  if (!is_ipmc) {
+    group_type = SAI_OBJECT_TYPE_L2MC_GROUP;
+    group_member_type = SAI_OBJECT_TYPE_L2MC_GROUP_MEMBER;
+  }
+
   std::string group_msg = m_p4OidMapper->verifyOIDMapping(
-      SAI_OBJECT_TYPE_IPMC_GROUP,
-      multicast_group_entry->multicast_group_id,
+      group_type, multicast_group_entry->multicast_group_id,
       multicast_group_entry->multicast_group_oid);
   if (!group_msg.empty()) {
     return group_msg;
@@ -2904,8 +2919,8 @@ std::string L3MulticastManager::verifyMulticastGroupStateCache(
 
   // Check group member OIDs for replicas.
   for (auto& kv : multicast_group_entry->member_oids) {
-    std::string group_member_msg = m_p4OidMapper->verifyOIDMapping(
-        SAI_OBJECT_TYPE_IPMC_GROUP_MEMBER, kv.first, kv.second);
+    std::string group_member_msg =
+        m_p4OidMapper->verifyOIDMapping(group_member_type, kv.first, kv.second);
     if (!group_member_msg.empty()) {
       return group_member_msg;
     }
@@ -2913,7 +2928,7 @@ std::string L3MulticastManager::verifyMulticastGroupStateCache(
   return "";
 }
 
-std::string L3MulticastManager::verifyMulticastGroupStateAsicDb(
+std::string L3MulticastManager::verifyIpMulticastGroupStateAsicDb(
     const P4MulticastGroupEntry* multicast_group_entry) {
 
   // Confirm group settings.
@@ -2943,15 +2958,6 @@ std::string L3MulticastManager::verifyMulticastGroupStateAsicDb(
   for (auto& replica : multicast_group_entry->replicas) {
     // Confirm have RIF for each replica.
     sai_object_id_t rif_oid = getRifOid(replica);
-    if (rif_oid == SAI_NULL_OBJECT_ID) {
-      std::stringstream msg;
-      msg << "Unable to find RIF associated with replica "
-          << QuotedVar(replica.key)
-          << " for multicast group "
-          << QuotedVar(multicast_group_entry->multicast_group_id);
-      return msg.str();
-    }
-
     sai_object_id_t group_member_oid = SAI_NULL_OBJECT_ID;
     if (multicast_group_entry->member_oids.find(replica.key) !=
         multicast_group_entry->member_oids.end()) {
@@ -2977,6 +2983,72 @@ std::string L3MulticastManager::verifyMulticastGroupStateAsicDb(
     }
   }
   return "";
+}
+
+std::string L3MulticastManager::verifyL2MulticastGroupStateAsicDb(
+    const P4MulticastGroupEntry* multicast_group_entry) {
+  // Confirm group settings.
+  swss::DBConnector db("ASIC_DB", 0);
+  swss::Table table(&db, "ASIC_STATE");
+  std::string key =
+      sai_serialize_object_type(SAI_OBJECT_TYPE_L2MC_GROUP) + ":" +
+      sai_serialize_object_id(multicast_group_entry->multicast_group_oid);
+  std::vector<swss::FieldValueTuple> values;
+  if (!table.get(key, values)) {
+    return std::string("ASIC DB key not found ") + key;
+  }
+  // There are no L2MC group attributes to verify.  The attributes that do
+  // exist are read-only attributes related to how many group members there are.
+  // We check group members and their attributes below.
+
+  // Confirm group member settings.
+  for (auto& replica : multicast_group_entry->replicas) {
+    // Confirm have RIF for each replica.
+    sai_object_id_t bridge_port_oid = getBridgePortOid(replica);
+
+    sai_object_id_t group_member_oid = SAI_NULL_OBJECT_ID;
+    if (multicast_group_entry->member_oids.find(replica.key) !=
+        multicast_group_entry->member_oids.end()) {
+      group_member_oid = multicast_group_entry->member_oids.at(replica.key);
+    }
+
+    auto member_attrs = prepareL2MulticastGroupMemberSaiAttrs(
+        multicast_group_entry->multicast_group_oid, bridge_port_oid);
+    std::vector<swss::FieldValueTuple> exp =
+        saimeta::SaiAttributeList::serialize_attr_list(
+            SAI_OBJECT_TYPE_L2MC_GROUP_MEMBER, (uint32_t)member_attrs.size(),
+            member_attrs.data(), /*countOnly=*/false);
+    key = sai_serialize_object_type(SAI_OBJECT_TYPE_L2MC_GROUP_MEMBER) + ":" +
+          sai_serialize_object_id(group_member_oid);
+    values.clear();
+    if (!table.get(key, values)) {
+      return std::string("ASIC DB key not found ") + key;
+    }
+    std::string group_member_msg =
+        verifyAttrs(values, exp, std::vector<swss::FieldValueTuple>{},
+                    /*allow_unknown=*/false);
+    if (!group_member_msg.empty()) {
+      return group_member_msg;
+    }
+  }
+  return "";
+}
+
+std::string L3MulticastManager::verifyMulticastGroupStateAsicDb(
+    const P4MulticastGroupEntry* multicast_group_entry) {
+  auto is_ipmc_or = validateReplicas(*multicast_group_entry);
+  if (!is_ipmc_or.ok()) {
+    std::stringstream msg;
+    msg << "Unable to determine multicast group type for "
+        << QuotedVar(multicast_group_entry->multicast_group_id);
+    return msg.str();
+  }
+  bool is_ipmc = *is_ipmc_or;
+  if (is_ipmc) {
+    return verifyIpMulticastGroupStateAsicDb(multicast_group_entry);
+  } else {
+    return verifyL2MulticastGroupStateAsicDb(multicast_group_entry);
+  }
 }
 
 P4MulticastRouterInterfaceEntry*

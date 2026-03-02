@@ -6138,6 +6138,92 @@ TEST_F(L3MulticastManagerTest, DrainUnknownFirstTable) {
   EXPECT_EQ(StatusCode::SWSS_RC_NOT_EXECUTED, Drain(/*failure_before=*/false));
 }
 
+TEST_F(L3MulticastManagerTest, DrainL2MulticastGroupEntryAddSuccessTest) {
+  auto bridge_entry1 = SetupP4MulticastRouterInterfaceNoActionEntry(
+      "Ethernet1", /*instance=*/"0x0", kBridgePortOid1);
+  auto bridge_entry2 = SetupP4MulticastRouterInterfaceNoActionEntry(
+      "Ethernet2", /*instance=*/"0x0", kBridgePortOid2);
+  P4Replica replica1 = P4Replica("0x0001", "Ethernet1", "0x0");
+  P4Replica replica2 = P4Replica("0x0001", "Ethernet2", "0x0");
+
+  const std::string group_match_key = "0x0001";
+  const std::string group_appl_db_key =
+      std::string(APP_P4RT_REPLICATION_IP_MULTICAST_TABLE_NAME) +
+      kTableKeyDelimiter + group_match_key;
+  std::vector<swss::FieldValueTuple> group_attributes;
+  const std::string json_array = R"([{"multicast_replica_instance":"0x0",)"
+                                 R"("multicast_replica_port":"Ethernet1"},)"
+                                 R"({"multicast_replica_instance":"0x0",)"
+                                 R"("multicast_replica_port":"Ethernet2"}])";
+  group_attributes.push_back(swss::FieldValueTuple{"replicas", json_array});
+  group_attributes.push_back(
+      swss::FieldValueTuple{p4orch::kControllerMetadata, "controller_meta"});
+  group_attributes.push_back(
+      swss::FieldValueTuple{p4orch::kMulticastMetadata, "multicast_meta"});
+
+  Enqueue(APP_P4RT_REPLICATION_IP_MULTICAST_TABLE_NAME,
+          swss::KeyOpFieldsValuesTuple(group_appl_db_key, SET_COMMAND,
+                                       group_attributes));
+
+  EXPECT_CALL(mock_sai_l2mc_group_, create_l2mc_group(_, _, _, _))
+      .WillOnce(
+          DoAll(SetArgPointee<0>(kGroupOid1), Return(SAI_STATUS_SUCCESS)));
+  std::vector<sai_attribute_t> exp_member_attrs;
+  sai_attribute_t attr;
+  attr.id = SAI_L2MC_GROUP_MEMBER_ATTR_L2MC_GROUP_ID;
+  attr.value.oid = kGroupOid1;
+  exp_member_attrs.push_back(attr);
+  attr.id = SAI_L2MC_GROUP_MEMBER_ATTR_L2MC_OUTPUT_ID;
+  attr.value.oid = kBridgePortOid1;
+  exp_member_attrs.push_back(attr);
+
+  EXPECT_CALL(mock_sai_l2mc_group_,
+              create_l2mc_group_member(_, _, 2, AttrArrayEq(exp_member_attrs)))
+      .WillOnce(DoAll(SetArgPointee<0>(kGroupMemberOid1),
+                      Return(SAI_STATUS_SUCCESS)));
+
+  std::vector<sai_attribute_t> exp_member_attrs2;
+  attr.id = SAI_L2MC_GROUP_MEMBER_ATTR_L2MC_GROUP_ID;
+  attr.value.oid = kGroupOid1;
+  exp_member_attrs2.push_back(attr);
+  attr.id = SAI_L2MC_GROUP_MEMBER_ATTR_L2MC_OUTPUT_ID;
+  attr.value.oid = kBridgePortOid2;
+  exp_member_attrs2.push_back(attr);
+  EXPECT_CALL(mock_sai_l2mc_group_,
+              create_l2mc_group_member(_, _, 2, AttrArrayEq(exp_member_attrs2)))
+      .WillOnce(DoAll(SetArgPointee<0>(kGroupMemberOid2),
+                      Return(SAI_STATUS_SUCCESS)));
+
+  EXPECT_CALL(publisher_, publish(Eq(APP_P4RT_TABLE_NAME),
+                                  Eq(group_appl_db_key), Eq(group_attributes),
+                                  Eq(StatusCode::SWSS_RC_SUCCESS), Eq(true)));
+  EXPECT_EQ(StatusCode::SWSS_RC_SUCCESS, Drain(/*failure_before=*/false));
+
+  auto expect_group_entry = GenerateP4MulticastGroupEntry(
+      "0x0001", {replica1, replica2}, "multicast_meta", "controller_meta");
+  expect_group_entry.multicast_group_oid = kGroupOid1;
+  expect_group_entry.member_oids[replica1.key] = kGroupMemberOid1;
+  expect_group_entry.member_oids[replica2.key] = kGroupMemberOid2;
+
+  auto* actual_group_entry =
+      GetMulticastGroupEntry(expect_group_entry.multicast_group_id);
+  ASSERT_NE(nullptr, actual_group_entry);
+  VerifyP4MulticastGroupEntryEqual(expect_group_entry, *actual_group_entry);
+
+  sai_object_id_t end_groupOid = SAI_NULL_OBJECT_ID;
+  p4_oid_mapper_.getOID(SAI_OBJECT_TYPE_L2MC_GROUP,
+                        actual_group_entry->multicast_group_id, &end_groupOid);
+  sai_object_id_t end_groupMemberOid = SAI_NULL_OBJECT_ID;
+  p4_oid_mapper_.getOID(SAI_OBJECT_TYPE_L2MC_GROUP_MEMBER, replica1.key,
+                        &end_groupMemberOid);
+  sai_object_id_t end_groupMemberOid2 = SAI_NULL_OBJECT_ID;
+  p4_oid_mapper_.getOID(SAI_OBJECT_TYPE_L2MC_GROUP_MEMBER, replica2.key,
+                        &end_groupMemberOid2);
+  EXPECT_EQ(end_groupOid, kGroupOid1);
+  EXPECT_EQ(end_groupMemberOid, kGroupMemberOid1);
+  EXPECT_EQ(end_groupMemberOid2, kGroupMemberOid2);
+}
+
 TEST_F(L3MulticastManagerTest, VerifyStateMulticastGroupTestSuccess) {
   // Add router interface entry so have RIF.
   auto rif_entry = SetupP4MulticastRouterInterfaceEntry(
@@ -6430,6 +6516,125 @@ TEST_F(L3MulticastManagerTest, VerifyStateMulticastGroupFailures) {
   table.del("SAI_OBJECT_TYPE_IPMC_GROUP:oid:0x1");
   EXPECT_FALSE(VerifyState(db_key, attributes).empty());
   table.del("SAI_OBJECT_TYPE_IPMC_GROUP_MEMBER:oid:0x11");
+}
+
+TEST_F(L3MulticastManagerTest, VerifyStateL2MulticastGroupTestSuccess) {
+  auto bridge_entry1 = SetupP4MulticastRouterInterfaceNoActionEntry(
+      "Ethernet1", /*instance=*/"0x0", kBridgePortOid1);
+  P4Replica replica1 = P4Replica("0x0001", "Ethernet1", "0x0");
+  auto entry = SetupP4L2MulticastGroupEntry(
+      "0x0001", {replica1}, kGroupOid1, {kGroupMemberOid1}, {kBridgePortOid1});
+
+  const std::string appl_db_key =
+      std::string(APP_P4RT_REPLICATION_IP_MULTICAST_TABLE_NAME) +
+      kTableKeyDelimiter + "0x0001";
+  const std::string db_key =
+      std::string(APP_P4RT_TABLE_NAME) + kTableKeyDelimiter + appl_db_key;
+  std::vector<swss::FieldValueTuple> attributes;
+  const std::string json_array = R"([{"multicast_replica_instance":"0x0",)"
+                                 R"("multicast_replica_port":"Ethernet1"}])";
+  attributes.push_back(swss::FieldValueTuple{"replicas", json_array});
+
+  // Setup ASIC DB.
+  swss::Table table(nullptr, "ASIC_STATE");
+  table.set("SAI_OBJECT_TYPE_L2MC_GROUP:oid:0x1",
+            std::vector<swss::FieldValueTuple>{});
+  table.set("SAI_OBJECT_TYPE_L2MC_GROUP_MEMBER:oid:0x11",
+            std::vector<swss::FieldValueTuple>{
+                swss::FieldValueTuple{
+                    "SAI_L2MC_GROUP_MEMBER_ATTR_L2MC_GROUP_ID", "oid:0x1"},
+                swss::FieldValueTuple{
+                    "SAI_L2MC_GROUP_MEMBER_ATTR_L2MC_OUTPUT_ID", "oid:0x101"}});
+
+  // Verification should succeed with vaild key and value.
+  EXPECT_EQ(VerifyState(db_key, attributes), "");
+  table.del("SAI_OBJECT_TYPE_L2MC_GROUP:oid:0x1");
+  table.del("SAI_OBJECT_TYPE_L2MC_GROUP_MEMBER:oid:0x11");
+}
+
+TEST_F(L3MulticastManagerTest, VerifyStateL2MulticastGroupMissBridgePort) {
+  auto bridge_entry1 = SetupP4MulticastRouterInterfaceNoActionEntry(
+      "Ethernet1", /*instance=*/"0x0", kBridgePortOid1);
+  P4Replica replica1 = P4Replica("0x0001", "Ethernet1", "0x0");
+  auto entry = SetupP4L2MulticastGroupEntry(
+      "0x0001", {replica1}, kGroupOid1, {kGroupMemberOid1}, {kBridgePortOid1});
+
+  const std::string appl_db_key =
+      std::string(APP_P4RT_REPLICATION_IP_MULTICAST_TABLE_NAME) +
+      kTableKeyDelimiter + "0x0001";
+  const std::string db_key =
+      std::string(APP_P4RT_TABLE_NAME) + kTableKeyDelimiter + appl_db_key;
+  std::vector<swss::FieldValueTuple> attributes;
+  const std::string json_array = R"([{"multicast_replica_instance":"0x0",)"
+                                 R"("multicast_replica_port":"Ethernet1"}])";
+  attributes.push_back(swss::FieldValueTuple{"replicas", json_array});
+
+  // Setup ASIC DB.
+  swss::Table table(nullptr, "ASIC_STATE");
+  table.set("SAI_OBJECT_TYPE_L2MC_GROUP:oid:0x1",
+            std::vector<swss::FieldValueTuple>{});
+  table.set("SAI_OBJECT_TYPE_L2MC_GROUP_MEMBER:oid:0x11",
+            std::vector<swss::FieldValueTuple>{
+                swss::FieldValueTuple{
+                    "SAI_L2MC_GROUP_MEMBER_ATTR_L2MC_GROUP_ID", "oid:0x1"},
+                swss::FieldValueTuple{
+                    "SAI_L2MC_GROUP_MEMBER_ATTR_L2MC_OUTPUT_ID", "oid:0x101"}});
+
+  // Force removal of bridge port.
+  p4_oid_mapper_.decreaseRefCount(SAI_OBJECT_TYPE_BRIDGE_PORT, "Ethernet1");
+  p4_oid_mapper_.decreaseRefCount(SAI_OBJECT_TYPE_BRIDGE_PORT, "Ethernet1");
+  p4_oid_mapper_.eraseOID(SAI_OBJECT_TYPE_BRIDGE_PORT, "Ethernet1");
+
+  // Verification should fail.
+  EXPECT_NE(VerifyState(db_key, attributes), "");
+  table.del("SAI_OBJECT_TYPE_L2MC_GROUP:oid:0x1");
+  table.del("SAI_OBJECT_TYPE_L2MC_GROUP_MEMBER:oid:0x11");
+}
+
+TEST_F(L3MulticastManagerTest, VerifyStateL2MulticastGroupMissingAsicDb) {
+  auto bridge_entry1 = SetupP4MulticastRouterInterfaceNoActionEntry(
+      "Ethernet1", /*instance=*/"0x0", kBridgePortOid1);
+  P4Replica replica1 = P4Replica("0x0001", "Ethernet1", "0x0");
+  auto entry = SetupP4L2MulticastGroupEntry(
+      "0x0001", {replica1}, kGroupOid1, {kGroupMemberOid1}, {kBridgePortOid1});
+
+  const std::string appl_db_key =
+      std::string(APP_P4RT_REPLICATION_IP_MULTICAST_TABLE_NAME) +
+      kTableKeyDelimiter + "0x0001";
+  const std::string db_key =
+      std::string(APP_P4RT_TABLE_NAME) + kTableKeyDelimiter + appl_db_key;
+  std::vector<swss::FieldValueTuple> attributes;
+  const std::string json_array = R"([{"multicast_replica_instance":"0x0",)"
+                                 R"("multicast_replica_port":"Ethernet1"}])";
+  attributes.push_back(swss::FieldValueTuple{"replicas", json_array});
+
+  // Setup ASIC DB.
+  swss::Table table(nullptr, "ASIC_STATE");
+  table.set("SAI_OBJECT_TYPE_L2MC_GROUP:oid:0x1",
+            std::vector<swss::FieldValueTuple>{});
+  table.set(
+      "SAI_OBJECT_TYPE_L2MC_GROUP_MEMBER:oid:0x11",
+      std::vector<swss::FieldValueTuple>{
+          swss::FieldValueTuple{"SAI_L2MC_GROUP_MEMBER_ATTR_L2MC_GROUP_ID",
+                                "oid:0x2"},  // this is wrong OID
+          swss::FieldValueTuple{"SAI_L2MC_GROUP_MEMBER_ATTR_L2MC_OUTPUT_ID",
+                                "oid:0x123456"}});
+
+  // Verification should fail, since ASIC DB attribute is wrong.
+  EXPECT_FALSE(VerifyState(db_key, attributes).empty());
+
+  // No key should also fail.
+  table.del("SAI_OBJECT_TYPE_L2MC_GROUP:oid:0x1");
+  EXPECT_FALSE(VerifyState(db_key, attributes).empty());
+
+  // Reset group, but delete group member
+  table.set("SAI_OBJECT_TYPE_L2MC_GROUP:oid:0x1",
+            std::vector<swss::FieldValueTuple>{});
+  table.del("SAI_OBJECT_TYPE_L2MC_GROUP_MEMBER:oid:0x11");
+  // No key should also fail.
+  EXPECT_FALSE(VerifyState(db_key, attributes).empty());
+
+  table.del("SAI_OBJECT_TYPE_L2MC_GROUP:oid:0x1");
 }
 
 }  // namespace p4orch
